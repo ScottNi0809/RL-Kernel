@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Bias-free gated FFN assembled from deterministic GPU kernels."""
+"""Bias-free gated FFN assembled from deterministic CUDA kernels."""
 
 from __future__ import annotations
 
@@ -201,9 +201,9 @@ def _require_ffn_kernels(*, disable_split_k: bool, packed_gate_up: bool = False)
     if not _EXT_AVAILABLE or _C is None or missing:
         suffix = f" Missing symbols: {', '.join(missing)}." if missing else ""
         needed = (
-            "compiled deterministic GEMM and SwiGLU GPU kernels"
+            "compiled deterministic GEMM and SwiGLU CUDA kernels"
             if disable_split_k
-            else "compiled SwiGLU GPU kernels"
+            else "compiled SwiGLU CUDA kernels"
         )
         raise RuntimeError(f"qwen3_ffn requires the {needed}.{suffix}")
 
@@ -240,6 +240,33 @@ def _linear_dw(a: Tensor, grad_output: Tensor, *, disable_split_k: bool) -> Tens
         )
     with torch.no_grad():
         return torch.matmul(grad_output.t().contiguous(), a)
+
+
+def _cp_sharded_linear_dw(
+    a: Tensor,
+    grad_output: Tensor,
+    *,
+    collective: Any,
+    disable_split_k: bool,
+) -> Tensor:
+    """Compute disjoint output rows, then reconstruct the exact full wgrad."""
+
+    world_size = int(collective.world_size)
+    output_rows = int(grad_output.size(1))
+    if output_rows % world_size != 0:
+        raise ValueError(
+            "CP-sharded weight-gradient rows must divide evenly across ranks, "
+            f"got {output_rows} rows and world_size={world_size}."
+        )
+    rows_per_rank = output_rows // world_size
+    row_start = int(collective.rank) * rows_per_rank
+    grad_output_shard = grad_output.narrow(1, row_start, rows_per_rank).contiguous()
+    local_weight_gradient = _linear_dw(
+        a,
+        grad_output_shard,
+        disable_split_k=disable_split_k,
+    )
+    return collective.all_gather(local_weight_gradient.contiguous())
 
 
 def _require_parallel_group(group: Any, name: str):
@@ -306,8 +333,7 @@ def _validate_ffn_inputs(
         if tensor.dtype != torch.bfloat16:
             raise TypeError(f"{name} must have dtype bfloat16, got {tensor.dtype}.")
         if not tensor.is_cuda:
-            # PyTorch exposes AMD GPU tensors through the torch.cuda API too.
-            raise RuntimeError(f"{name} must be on a CUDA/ROCm GPU device, got '{tensor.device}'.")
+            raise RuntimeError(f"{name} must be on a CUDA device, got '{tensor.device}'.")
         if tensor.device != rmsnorm_output.device:
             raise RuntimeError(
                 f"all FFN inputs must be on {rmsnorm_output.device}, "
@@ -371,14 +397,8 @@ class _DeterministicFFNFunction(torch.autograd.Function):
         tp_world = tp_dist.get_world_size(group=tp_group) if tp_dist is not None else 1
         gemm_tokens = rmsnorm_output_2d.size(0) * (tp_world if sequence_parallel else 1)
         element_size = rmsnorm_output_2d.element_size()
-        token_hidden_bytes = gemm_tokens * rmsnorm_output_2d.size(1) * element_size
-        # Sequence-parallel backward reduces the gate and up input-gradient
-        # lanes together. ``reduce_scatter_many`` packs those lanes along the
-        # final dimension, so reserve capacity for both lanes in one transport
-        # call rather than growing the collective (or failing) mid-backward.
-        reduction_bytes = token_hidden_bytes * (2 if sequence_parallel else 1)
         min_size_bytes = max(
-            reduction_bytes,
+            gemm_tokens * rmsnorm_output_2d.size(1) * element_size,
             gemm_tokens * gate_weight.size(0) * element_size,
             gate_weight.numel() * element_size,
             up_weight.numel() * element_size,
@@ -510,19 +530,22 @@ class _DeterministicFFNFunction(torch.autograd.Function):
                 grad_up,
                 collective=cp_collective,
             )
-            grad_down_weight = _linear_dw(
+            grad_down_weight = _cp_sharded_linear_dw(
                 activated_full,
                 grad_output_full,
+                collective=cp_collective,
                 disable_split_k=disable_split_k,
             )
-            grad_gate_weight = _linear_dw(
+            grad_gate_weight = _cp_sharded_linear_dw(
                 rmsnorm_full,
                 grad_gate_full,
+                collective=cp_collective,
                 disable_split_k=disable_split_k,
             )
-            grad_up_weight = _linear_dw(
+            grad_up_weight = _cp_sharded_linear_dw(
                 rmsnorm_full,
                 grad_up_full,
+                collective=cp_collective,
                 disable_split_k=disable_split_k,
             )
         else:
@@ -548,25 +571,28 @@ class _DeterministicFFNFunction(torch.autograd.Function):
             gate_weight,
             disable_split_k=disable_split_k,
         )
-        grad_rmsnorm_from_up = _linear_da(
-            grad_up,
-            up_weight,
-            disable_split_k=disable_split_k,
-        )
         if ctx.sequence_parallel:
-            # These are independent reduction lanes. Pack them into one
-            # ReduceScatter while keeping each lane's balanced rank tree
-            # separate; adding them before the collective would change the
-            # floating-point parenthesization and break cross-TP bitwise
-            # invariance.
-            grad_rmsnorm_from_gate, grad_rmsnorm_from_up = tp_collective.reduce_scatter_many(
-                (grad_rmsnorm_from_gate, grad_rmsnorm_from_up)
+            grad_rmsnorm_from_gate = _reduce_scatter_tokens(
+                grad_rmsnorm_from_gate,
+                tp_collective,
             )
         elif tp_collective is not None:
             grad_rmsnorm_from_gate = _all_reduce_inplace(
                 grad_rmsnorm_from_gate,
                 tp_collective,
             )
+
+        grad_rmsnorm_from_up = _linear_da(
+            grad_up,
+            up_weight,
+            disable_split_k=disable_split_k,
+        )
+        if ctx.sequence_parallel:
+            grad_rmsnorm_from_up = _reduce_scatter_tokens(
+                grad_rmsnorm_from_up,
+                tp_collective,
+            )
+        elif tp_collective is not None:
             grad_rmsnorm_from_up = _all_reduce_inplace(
                 grad_rmsnorm_from_up,
                 tp_collective,
@@ -616,8 +642,7 @@ def qwen3_ffn(
             unchanged.
         tp_group: Optional tensor-parallel process group. Gate and Up are
             column-parallel; Down is row-parallel. Reductions use the
-            platform deterministic fixed-tree collectives. On ROCm, RCCL only
-            transports rank inputs and the reduction tree executes locally.
+            deterministic fixed-tree collectives rather than NCCL.
         cp_group: Optional context-parallel process group. Each rank owns
             different token rows and the same local weight shards. Weight
             gradients AllGather tokens along CP and run the full-token
@@ -709,11 +734,6 @@ class Qwen3FFNOp:
         dist = _require_parallel_group(tp_group, "tensor")
         if dist is None:
             return 0, 1
-        if getattr(torch.version, "hip", None) is not None:
-            raise RuntimeError(
-                "packed TP inference requires the native CUDA IPC collective and "
-                "is not available with the ROCm/RCCL transport"
-            )
         tp_world_size = int(dist.get_world_size(group=tp_group))
         if fused_gate_up_weight.size(0) % 2:
             raise ValueError("fused gate/up weight must contain two equal shards")
