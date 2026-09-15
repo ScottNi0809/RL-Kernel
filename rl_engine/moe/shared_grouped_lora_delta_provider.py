@@ -82,3 +82,36 @@ class LoRADeltaProvider(ReferenceProvider):
         da = du_bf16.float().T @ x.float()  # [r, K] FP32
         dx = du_bf16.float() @ a.float()  # [M, K] FP32
         return dx, da, db
+
+
+class LoRADeltaCudaProvider(LoRADeltaProvider):
+    """用现成的 det_gemm 组合, 先拿到 batch invariance。"""
+
+    name = "p5-3-lora-delta-detgemm"
+    numeric_profile = "det-gemm-midsplit-tree"
+
+    def provenance(self) -> dict[str, Any]:
+        return {
+            "requested_backend": self.name,
+            "actual_backend": "cuda-det_gemm-composed",
+            "numeric_profile": self.numeric_profile,
+            "torch_version": torch.__version__,
+        }
+
+    def shared_grouped_lora_delta_fwd(self, x, a, b, alpha):
+        import rl_engine._C as _C
+        # x @ a.T —— det_gemm 内部是 BF16 in / FP32 accum / BF16 store,
+        # 每 32 个元素 (K_TREE_LEAF) 舍一次 BF16, 所以精度不如全程 FP32 累加
+        u_bf16 = _C.det_gemm_fwd_rhs_transposed(x, a)
+        y = _C.det_gemm_fwd_rhs_transposed(u_bf16, b).float() * float(alpha)
+        return y, u_bf16  # 契约顺序是 (y, u_bf16), 不能颠倒
+
+    def shared_grouped_lora_delta_bwd(self, dy, x, a, b, alpha, u_bf16):
+        import rl_engine._C as _C
+
+        dys = (dy.float() * float(alpha)).to(torch.bfloat16)  # 舍入点2
+        du_bf16 = _C.det_gemm_fwd(dys, b)           # dys @ b   -> [M, r] BF16
+        db = _C.det_gemm_db(dys, u_bf16).float()    # dys.T @ u -> [N, r]
+        da = _C.det_gemm_db(du_bf16, x).float()     # du.T @ x  -> [r, K]
+        dx = _C.det_gemm_fwd(du_bf16, a).float()    # du @ a    -> [M, K]
+        return dx, da, db

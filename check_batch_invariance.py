@@ -18,9 +18,12 @@ while the underlying GEMM is already non-deterministic. This script therefore:
 
 from __future__ import annotations
 
+import argparse
+import importlib
+
 import torch
 
-from rl_engine.moe.shared_grouped_lora_delta_provider import LoRADeltaProvider
+DEFAULT_PROVIDER = "rl_engine.moe.shared_grouped_lora_delta_provider:LoRADeltaProvider"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEEDS = (0, 1, 2, 42, 2026)
@@ -76,13 +79,24 @@ def probe_one(provider, m_full: int, k: int, n: int, r: int, seed: int) -> list[
     return rows
 
 
+def resolve(spec: str):
+    """Instantiate a provider from 'module.path:ClassName'."""
+    module_name, class_name = spec.split(":", 1)
+    return getattr(importlib.import_module(module_name), class_name)()
+
+
 def main() -> int:
-    provider = LoRADeltaProvider()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--provider", default=DEFAULT_PROVIDER, help="module.path:ClassName")
+    args = parser.parse_args()
+
+    provider = resolve(args.provider)
     backend = provider.provenance()["actual_backend"]
     print(f"device={DEVICE}  provider={provider.name}  backend={backend}")
 
     total = 0
     failed = 0
+    per_boundary = {"u": 0, "y": 0, "dx": 0}
     for shape in SHAPES:
         m_full, k, n, r = shape
         print(f"\n=== shape M={m_full} K={k} N={n} r={r} ===")
@@ -95,6 +109,9 @@ def main() -> int:
                 total += 1
                 ok = row["u"] and row["y"] and row["dx"]
                 failed += 0 if ok else 1
+                for key in per_boundary:
+                    if not row[key]:
+                        per_boundary[key] += 1
                 u_cnt, u_mx = row["u_drift"]
                 y_cnt, y_mx = row["y_drift"]
                 print(
@@ -105,6 +122,11 @@ def main() -> int:
 
     print(f"\n{'=' * 60}")
     print(f"checks: {total}   violations: {failed}")
+    print("per-boundary violations (which stage is still non-deterministic):")
+    for key, cnt in per_boundary.items():
+        stage = {"u": "fwd GEMM 1", "y": "fwd GEMM 2", "dx": "bwd"}[key]
+        mark = "ok" if cnt == 0 else "FAIL"
+        print(f"  {key:>3} ({stage:<10}) {cnt:>3}/{total}  {mark}")
     if failed:
         print(
             "RESULT: NOT batch-invariant.\n"
